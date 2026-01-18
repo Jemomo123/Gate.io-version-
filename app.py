@@ -4,84 +4,133 @@ import pandas as pd
 import pandas_ta as ta
 import numpy as np
 from datetime import datetime
-from streamlit_autorefresh import st_autorefresh
+from github import Github
 import time
 
-# --- CONFIGURATION ---
-BATCH_SIZE = 10 # Gate.io handles slightly larger batches than MEXC
-REST_TIME = 1.0 
+# --- INITIAL CONFIG ---
+st.set_page_config(page_title="Goliath Gate.io Scanner", page_icon="🎯", layout="wide")
 
-st.set_page_config(page_title="Gate.io Pro Scanner", page_icon="🎯", layout="wide")
+# CSS for Mobile Readability
+st.markdown("""
+    <style>
+    .stMetric { background-color: #1e1e1e; padding: 10px; border-radius: 10px; border: 1px solid #333; }
+    .up-signal { color: #00ff00; font-weight: bold; }
+    .down-signal { color: #ff4b4b; font-weight: bold; }
+    </style>
+""", unsafe_allow_html=True)
 
-# (Keep your existing CSS here)
-
+# --- EXCHANGE & DATA FUNCTIONS ---
 @st.cache_resource
 def init_exchange():
-    # Switching to Gate.io
+    """Initialize Gate.io via CCXT using secrets."""
     return ccxt.gateio({
-        'enableRateLimit': True, 
-        'options': {'defaultType': 'spot'},
-        'timeout': 30000
+        'apiKey': st.secrets["GATE_API_KEY"],
+        'secret': st.secrets["GATE_SECRET"],
+        'enableRateLimit': True,
+        'options': {'defaultType': 'spot'}
     })
 
-@st.cache_data(ttl=600)
-def get_gate_pairs(_exchange):
+def fetch_ohlcv(exchange, symbol, timeframe):
+    """Fetch candles with safety handling."""
     try:
-        markets = _exchange.load_markets()
-        # Gate uses symbols like 'BTC/USDT'
-        pairs = [s for s in markets.keys() if s.endswith('/USDT') and markets[s]['active']]
-        
-        # Sort and prioritize BTC
-        pairs.sort()
-        if 'BTC/USDT' in pairs:
-            pairs.insert(0, pairs.pop(pairs.index('BTC/USDT')))
-        return pairs
-    except Exception as e:
-        st.error(f"Error loading Gate.io markets: {e}")
-        return ['BTC/USDT']
+        data = exchange.fetch_ohlcv(symbol, timeframe, limit=201)
+        df = pd.DataFrame(data, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+        return df
+    except Exception:
+        return None
 
+def calculate_indicators(df):
+    """Calculate the 20/200 SMA and VWAP for the Goliath strategy."""
+    df['SMA20'] = ta.sma(df['c'], length=20)
+    df['SMA200'] = ta.sma(df['c'], length=200)
+    df['VWAP'] = ta.vwap(df['h'], df['l'], df['c'], df['v'])
+    return df
+
+# --- SIGNAL DETECTION ---
+def detect_signals(df, symbol, timeframe):
+    """Detects Crossovers, Squeezes, and Rejections."""
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    signals = []
+    
+    # 1. Golden/Death Cross
+    if prev['SMA20'] < prev['SMA200'] and last['SMA20'] > last['SMA200']:
+        signals.append({'type': 'Golden Cross', 'dir': 'UP'})
+    elif prev['SMA20'] > prev['SMA200'] and last['SMA20'] < last['SMA200']:
+        signals.append({'type': 'Death Cross', 'dir': 'DOWN'})
+    
+    # 2. SMA Squeeze (Gap less than 0.5%)
+    gap = abs(last['SMA20'] - last['SMA200']) / last['SMA200']
+    if gap < 0.005:
+        signals.append({'type': 'SMA Squeeze', 'dir': 'NEUTRAL'})
+
+    return [{**s, 'symbol': symbol, 'tf': timeframe, 'price': last['c']} for s in signals]
+
+# --- GITHUB LOGGING ---
+def log_to_github(signal):
+    """Logs signal to your GitHub repository."""
+    try:
+        g = Github(st.secrets["GITHUB_TOKEN"])
+        repo = g.get_repo(st.secrets["GITHUB_REPO"])
+        file_path = "goliath_signals.csv"
+        line = f"{datetime.now()},{signal['symbol']},{signal['type']},{signal['dir']},{signal['price']}\n"
+        
+        try:
+            content = repo.get_contents(file_path)
+            new_content = content.decoded_content.decode() + line
+            repo.update_file(file_path, f"Update {signal['symbol']}", new_content, content.sha)
+        except:
+            repo.create_file(file_path, "Initial log", "Time,Symbol,Type,Dir,Price\n" + line)
+        return True
+    except:
+        return False
+
+# --- MAIN APP ---
 def main():
-    st.markdown("# 🎯 Gate.io Pro Scanner")
-    st.caption("📱 16-Opportunity System - Goliath Strategy")
-    
+    st.title("🎯 Goliath Scanner (Gate.io)")
     exchange = init_exchange()
-    if not exchange:
-        st.stop()
-
-    usdt_pairs = get_gate_pairs(exchange)
     
-    with st.expander("⚙️ SETTINGS", expanded=False):
-        # Defensively load pairs to prevent the StreamlitAPIException
-        options_pool = usdt_pairs[:100]
-        desired_defaults = ['BTC/USDT'] + [p for p in usdt_pairs if p != 'BTC/USDT'][:9]
-        safe_defaults = [p for p in desired_defaults if p in options_pool]
-
-        st.markdown("### 📊 Trading Pairs")
-        selected_pairs = st.multiselect("Select pairs", options=options_pool, default=safe_defaults)
+    # Sidebar Settings
+    with st.sidebar:
+        st.header("Settings")
+        markets = exchange.load_markets()
+        pairs = sorted([s for s in markets.keys() if s.endswith('/USDT')])
         
-        st.markdown("### ⏱️ Timeframes")
-        # Aligned with your preferred timeframes
-        selected_timeframes = st.multiselect("Select timeframes", ['3m', '5m', '15m', '1h', '4h'], default=['15m', '1h', '4h'])
+        selected_pairs = st.multiselect("Pairs", pairs[:100], default=['BTC/USDT'])
+        selected_tfs = st.multiselect("Timeframes", ['15m', '1h', '4h'], default=['15m', '1h', '4h'])
         
-        auto_refresh = st.toggle("Enable (60s)", value=True)
-        st.session_state.auto_refresh_enabled = auto_refresh
+        show_up = st.checkbox("Show UP Signals", value=True)
+        show_down = st.checkbox("Show DOWN Signals", value=True)
 
-    # --- SCANNING LOGIC ---
-    scan_button = st.button("🔍 SCAN GATE.IO NOW", type="primary", use_container_width=True)
-
-    if scan_button:
-        if not selected_pairs:
-            st.warning("⚠️ Please select at least one pair.")
-        else:
-            with st.spinner("📡 Probing Gate.io Markets..."):
-                # Use your existing scan_markets function here
-                # It will now use the Gate.io exchange object
-                signals = scan_markets(exchange, selected_pairs, selected_timeframes)
-                st.session_state.signals = signals
-                st.session_state.last_update = datetime.now()
-                st.rerun()
-
-    # (Keep your existing Signal Display Logic here)
+    if st.button("🚀 START GLOBAL SCAN", use_container_width=True):
+        found_signals = []
+        progress = st.progress(0)
+        
+        for i, symbol in enumerate(selected_pairs):
+            for tf in selected_tfs:
+                df = fetch_ohlcv(exchange, symbol, tf)
+                if df is not None:
+                    df = calculate_indicators(df)
+                    found_signals.extend(detect_signals(df, symbol, tf))
+            
+            progress.progress((i + 1) / len(selected_pairs))
+            time.sleep(0.5) # Gate.io batch rest
+            
+        # Display Results
+        for sig in found_signals:
+            if sig['dir'] == 'UP' and not show_up: continue
+            if sig['dir'] == 'DOWN' and not show_down: continue
+            
+            with st.container():
+                col1, col2, col3 = st.columns([2, 2, 1])
+                color = "up-signal" if sig['dir'] == 'UP' else "down-signal"
+                col1.markdown(f"### {sig['symbol']} ({sig['tf']})")
+                col2.markdown(f"**Type:** {sig['type']} | **Dir:** <span class='{color}'>{sig['dir']}</span>", unsafe_allow_html=True)
+                
+                if col3.button("💾 Log", key=f"{sig['symbol']}_{sig['tf']}"):
+                    if log_to_github(sig):
+                        st.toast(f"Logged {sig['symbol']}!")
 
 if __name__ == "__main__":
     main()
