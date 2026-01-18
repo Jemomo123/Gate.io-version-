@@ -1,0 +1,7 @@
+streamlit
+ccxt
+pandas
+pandas_ta
+numpy
+streamlit-autorefresh
+PyGithub
