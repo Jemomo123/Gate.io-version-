@@ -7,130 +7,121 @@ from datetime import datetime
 from github import Github
 import time
 
-# --- INITIAL CONFIG ---
-st.set_page_config(page_title="Goliath Gate.io Scanner", page_icon="🎯", layout="wide")
+# --- CONFIG ---
+st.set_page_config(page_title="Goliath Gate.io Mobile", page_icon="🎯", layout="wide")
 
-# CSS for Mobile Readability
+# CSS for a clean mobile dark-mode feel
 st.markdown("""
     <style>
     .stMetric { background-color: #1e1e1e; padding: 10px; border-radius: 10px; border: 1px solid #333; }
-    .up-signal { color: #00ff00; font-weight: bold; }
-    .down-signal { color: #ff4b4b; font-weight: bold; }
+    .up-signal { color: #00ff00; font-weight: bold; font-size: 1.2rem; }
+    .down-signal { color: #ff4b4b; font-weight: bold; font-size: 1.2rem; }
+    hr { margin: 10px 0px; border-top: 1px solid #444; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- EXCHANGE & DATA FUNCTIONS ---
 @st.cache_resource
 def init_exchange():
-    """Initialize Gate.io via CCXT using secrets."""
-    return ccxt.gateio({
-        'apiKey': st.secrets["GATE_API_KEY"],
-        'secret': st.secrets["GATE_SECRET"],
-        'enableRateLimit': True,
-        'options': {'defaultType': 'spot'}
-    })
+    """Initialize Gate.io safely using Streamlit Secrets."""
+    try:
+        return ccxt.gateio({
+            'apiKey': st.secrets["GATE_API_KEY"],
+            'secret': st.secrets["GATE_SECRET"],
+            'enableRateLimit': True,
+            'options': {'defaultType': 'spot'}
+        })
+    except Exception as e:
+        st.error(f"Failed to connect to Gate.io: {e}")
+        return None
 
 def fetch_ohlcv(exchange, symbol, timeframe):
-    """Fetch candles with safety handling."""
     try:
-        data = exchange.fetch_ohlcv(symbol, timeframe, limit=201)
+        data = exchange.fetch_ohlcv(symbol, timeframe, limit=205)
         df = pd.DataFrame(data, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         return df
-    except Exception:
+    except:
         return None
 
 def calculate_indicators(df):
-    """Calculate the 20/200 SMA and VWAP for the Goliath strategy."""
     df['SMA20'] = ta.sma(df['c'], length=20)
     df['SMA200'] = ta.sma(df['c'], length=200)
-    df['VWAP'] = ta.vwap(df['h'], df['l'], df['c'], df['v'])
     return df
 
-# --- SIGNAL DETECTION ---
 def detect_signals(df, symbol, timeframe):
-    """Detects Crossovers, Squeezes, and Rejections."""
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    last, prev = df.iloc[-1], df.iloc[-2]
     signals = []
     
-    # 1. Golden/Death Cross
+    # Golden / Death Cross
     if prev['SMA20'] < prev['SMA200'] and last['SMA20'] > last['SMA200']:
         signals.append({'type': 'Golden Cross', 'dir': 'UP'})
     elif prev['SMA20'] > prev['SMA200'] and last['SMA20'] < last['SMA200']:
         signals.append({'type': 'Death Cross', 'dir': 'DOWN'})
     
-    # 2. SMA Squeeze (Gap less than 0.5%)
+    # Squeeze Detection (Within 0.4%)
     gap = abs(last['SMA20'] - last['SMA200']) / last['SMA200']
-    if gap < 0.005:
+    if gap < 0.004:
         signals.append({'type': 'SMA Squeeze', 'dir': 'NEUTRAL'})
 
     return [{**s, 'symbol': symbol, 'tf': timeframe, 'price': last['c']} for s in signals]
 
-# --- GITHUB LOGGING ---
-def log_to_github(signal):
-    """Logs signal to your GitHub repository."""
-    try:
-        g = Github(st.secrets["GITHUB_TOKEN"])
-        repo = g.get_repo(st.secrets["GITHUB_REPO"])
-        file_path = "goliath_signals.csv"
-        line = f"{datetime.now()},{signal['symbol']},{signal['type']},{signal['dir']},{signal['price']}\n"
-        
-        try:
-            content = repo.get_contents(file_path)
-            new_content = content.decoded_content.decode() + line
-            repo.update_file(file_path, f"Update {signal['symbol']}", new_content, content.sha)
-        except:
-            repo.create_file(file_path, "Initial log", "Time,Symbol,Type,Dir,Price\n" + line)
-        return True
-    except:
-        return False
-
-# --- MAIN APP ---
 def main():
-    st.title("🎯 Goliath Scanner (Gate.io)")
+    st.title("🎯 Goliath Scanner")
     exchange = init_exchange()
-    
-    # Sidebar Settings
-    with st.sidebar:
-        st.header("Settings")
+    if not exchange: st.stop()
+
+    # Load Pairs for selection
+    try:
         markets = exchange.load_markets()
-        pairs = sorted([s for s in markets.keys() if s.endswith('/USDT')])
-        
-        selected_pairs = st.multiselect("Pairs", pairs[:100], default=['BTC/USDT'])
+        all_pairs = sorted([s for s in markets.keys() if s.endswith('/USDT') and markets[s]['active']])
+    except:
+        all_pairs = ['BTC/USDT', 'ETH/USDT']
+
+    # --- DEFENSIVE SELECTION LOGIC ---
+    # Ensures BTC is found even if naming varies (e.g. BTC/USDT vs BTC_USDT)
+    options_pool = all_pairs[:120]
+    btc_match = next((s for s in options_pool if "BTC" in s and "USDT" in s), None)
+    safe_defaults = [btc_match] if btc_match else ([options_pool[0]] if options_pool else [])
+
+    with st.expander("⚙️ SCANNER SETTINGS", expanded=False):
+        selected_pairs = st.multiselect("Pairs to Scan", options_pool, default=safe_defaults)
         selected_tfs = st.multiselect("Timeframes", ['15m', '1h', '4h'], default=['15m', '1h', '4h'])
-        
         show_up = st.checkbox("Show UP Signals", value=True)
         show_down = st.checkbox("Show DOWN Signals", value=True)
 
-    if st.button("🚀 START GLOBAL SCAN", use_container_width=True):
-        found_signals = []
-        progress = st.progress(0)
+    if st.button("🔍 START SCAN", type="primary", use_container_width=True):
+        results = []
+        prog = st.progress(0)
         
-        for i, symbol in enumerate(selected_pairs):
+        for i, pair in enumerate(selected_pairs):
             for tf in selected_tfs:
-                df = fetch_ohlcv(exchange, symbol, tf)
+                df = fetch_ohlcv(exchange, pair, tf)
                 if df is not None:
                     df = calculate_indicators(df)
-                    found_signals.extend(detect_signals(df, symbol, tf))
-            
-            progress.progress((i + 1) / len(selected_pairs))
-            time.sleep(0.5) # Gate.io batch rest
-            
-        # Display Results
-        for sig in found_signals:
-            if sig['dir'] == 'UP' and not show_up: continue
-            if sig['dir'] == 'DOWN' and not show_down: continue
-            
-            with st.container():
-                col1, col2, col3 = st.columns([2, 2, 1])
-                color = "up-signal" if sig['dir'] == 'UP' else "down-signal"
-                col1.markdown(f"### {sig['symbol']} ({sig['tf']})")
-                col2.markdown(f"**Type:** {sig['type']} | **Dir:** <span class='{color}'>{sig['dir']}</span>", unsafe_allow_html=True)
+                    results.extend(detect_signals(df, pair, tf))
+            prog.progress((i + 1) / len(selected_pairs))
+            time.sleep(0.3) # Respect Gate.io rate limits
+
+        if not results:
+            st.info("No signals found in this batch.")
+        else:
+            for sig in results:
+                # Filtering logic
+                if sig['dir'] == 'UP' and not show_up: continue
+                if sig['dir'] == 'DOWN' and not show_down: continue
                 
-                if col3.button("💾 Log", key=f"{sig['symbol']}_{sig['tf']}"):
-                    if log_to_github(sig):
-                        st.toast(f"Logged {sig['symbol']}!")
+                # Mobile-friendly signal card
+                with st.container():
+                    c1, c2 = st.columns([3, 2])
+                    color_class = "up-signal" if sig['dir'] == 'UP' else "down-signal"
+                    
+                    c1.markdown(f"**{sig['symbol']}** ({sig['tf']})")
+                    c1.markdown(f"<span class='{color_class}'>{sig['type']}</span>", unsafe_allow_html=True)
+                    
+                    # Deep link to Gate.io Trade Page
+                    trade_url = f"https://www.gate.io/trade/{sig['symbol'].replace('/', '_')}"
+                    c2.link_button("🚀 Trade", trade_url, use_container_width=True)
+                    st.markdown("---")
 
 if __name__ == "__main__":
     main()
