@@ -2,126 +2,89 @@ import streamlit as st
 import ccxt
 import pandas as pd
 import pandas_ta as ta
-import numpy as np
-from datetime import datetime
-from github import Github
 import time
 
-# --- CONFIG ---
-st.set_page_config(page_title="Goliath Gate.io Mobile", page_icon="🎯", layout="wide")
+# --- MOBILE UI SETUP ---
+st.set_page_config(page_title="Goliath Scanner", layout="wide")
 
-# CSS for a clean mobile dark-mode feel
 st.markdown("""
     <style>
-    .stMetric { background-color: #1e1e1e; padding: 10px; border-radius: 10px; border: 1px solid #333; }
-    .up-signal { color: #00ff00; font-weight: bold; font-size: 1.2rem; }
-    .down-signal { color: #ff4b4b; font-weight: bold; font-size: 1.2rem; }
-    hr { margin: 10px 0px; border-top: 1px solid #444; }
+    .signal-card { border: 1px solid #333; padding: 10px; border-radius: 8px; margin-bottom: 10px; background: #161a21; }
+    .up { color: #00ff00; font-weight: bold; }
+    .down { color: #ff4b4b; font-weight: bold; }
     </style>
 """, unsafe_allow_html=True)
 
 @st.cache_resource
 def init_exchange():
-    """Initialize Gate.io safely using Streamlit Secrets."""
-    try:
-        return ccxt.gateio({
-            'apiKey': st.secrets["GATE_API_KEY"],
-            'secret': st.secrets["GATE_SECRET"],
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
-        })
-    except Exception as e:
-        st.error(f"Failed to connect to Gate.io: {e}")
-        return None
+    return ccxt.gateio({
+        'apiKey': st.secrets["GATE_API_KEY"],
+        'secret': st.secrets["GATE_SECRET"],
+        'enableRateLimit': True
+    })
 
-def fetch_ohlcv(exchange, symbol, timeframe):
-    try:
-        data = exchange.fetch_ohlcv(symbol, timeframe, limit=205)
-        df = pd.DataFrame(data, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-        return df
-    except:
-        return None
-
-def calculate_indicators(df):
-    df['SMA20'] = ta.sma(df['c'], length=20)
-    df['SMA200'] = ta.sma(df['c'], length=200)
-    return df
-
-def detect_signals(df, symbol, timeframe):
+def detect_signals(df, symbol, tf):
     last, prev = df.iloc[-1], df.iloc[-2]
-    signals = []
+    c, o, s20, s200 = last['c'], last['o'], last['SMA20'], last['SMA200']
+    rsi, vwap = last['RSI'], last['VWAP']
     
-    # Golden / Death Cross
-    if prev['SMA20'] < prev['SMA200'] and last['SMA20'] > last['SMA200']:
-        signals.append({'type': 'Golden Cross', 'dir': 'UP'})
-    elif prev['SMA20'] > prev['SMA200'] and last['SMA20'] < last['SMA200']:
-        signals.append({'type': 'Death Cross', 'dir': 'DOWN'})
-    
-    # Squeeze Detection (Within 0.4%)
-    gap = abs(last['SMA20'] - last['SMA200']) / last['SMA200']
-    if gap < 0.004:
-        signals.append({'type': 'SMA Squeeze', 'dir': 'NEUTRAL'})
+    sigs = []
+    prio = 1 if tf in ['3m', '5m', '15m'] else 2
 
-    return [{**s, 'symbol': symbol, 'tf': timeframe, 'price': last['c']} for s in signals]
+    # 1. Elephant Bars & V-Reversals
+    avg_body = abs(df['c'] - df['o']).tail(20).mean()
+    if abs(c - o) > (avg_body * 2.5):
+        sigs.append({'type': 'Elephant Bar', 'dir': 'UP' if c > o else 'DOWN', 'prio': prio})
+    
+    # 2. The Kisses (SMA 200)
+    if prev['l'] <= s200 and c > s200: sigs.append({'type': 'Kiss of Life', 'dir': 'UP', 'prio': prio})
+    if prev['h'] >= s200 and c < s200: sigs.append({'type': 'Kiss of Death', 'dir': 'DOWN', 'prio': prio})
+
+    # 3. Squeeze & Divergence
+    gap = abs(s20 - s200) / s200
+    if gap < 0.005: sigs.append({'type': 'Squeeze', 'dir': 'NEUTRAL', 'prio': prio})
+    if (abs(c - s20) / s20) > 0.05: sigs.append({'type': 'Wide State', 'dir': 'WATCH', 'prio': prio})
+
+    # 4. Value Snap (RSI/VWAP)
+    if rsi < 30 and c > vwap: sigs.append({'type': 'Value Snap', 'dir': 'UP', 'prio': prio})
+    if rsi > 70 and c < vwap: sigs.append({'type': 'Value Snap', 'dir': 'DOWN', 'prio': prio})
+
+    return [{**s, 'symbol': symbol, 'tf': tf, 'price': c} for s in sigs]
 
 def main():
     st.title("🎯 Goliath Scanner")
-    exchange = init_exchange()
-    if not exchange: st.stop()
+    ex = init_exchange()
+    
+    # Defensive Symbol Load
+    m = ex.load_markets()
+    pairs = sorted([s for s in m.keys() if s.endswith('/USDT') and m[s]['active']])
+    btc = next((s for s in pairs if "BTC" in s), pairs[0])
 
-    # Load Pairs for selection
-    try:
-        markets = exchange.load_markets()
-        all_pairs = sorted([s for s in markets.keys() if s.endswith('/USDT') and markets[s]['active']])
-    except:
-        all_pairs = ['BTC/USDT', 'ETH/USDT']
+    with st.sidebar:
+        sel_pairs = st.multiselect("Pairs", pairs[:100], default=[btc])
+        sel_tfs = st.multiselect("Timeframes", ['3m', '5m', '15m', '1h', '4h'], default=['3m', '15m', '1h'])
 
-    # --- DEFENSIVE SELECTION LOGIC ---
-    # Ensures BTC is found even if naming varies (e.g. BTC/USDT vs BTC_USDT)
-    options_pool = all_pairs[:120]
-    btc_match = next((s for s in options_pool if "BTC" in s and "USDT" in s), None)
-    safe_defaults = [btc_match] if btc_match else ([options_pool[0]] if options_pool else [])
+    if st.button("🚀 SCAN", use_container_width=True):
+        found = []
+        for p in sel_pairs:
+            for t in sel_tfs:
+                try:
+                    bars = ex.fetch_ohlcv(p, t, limit=205)
+                    df = pd.DataFrame(bars, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+                    df['SMA20'] = ta.sma(df['c'], 20); df['SMA200'] = ta.sma(df['c'], 200)
+                    df['RSI'] = ta.rsi(df['c'], 14); df['VWAP'] = ta.vwap(df['h'], df['l'], df['c'], df['v'])
+                    found.extend(detect_signals(df, p, t))
+                except: continue
+            time.sleep(0.5)
 
-    with st.expander("⚙️ SCANNER SETTINGS", expanded=False):
-        selected_pairs = st.multiselect("Pairs to Scan", options_pool, default=safe_defaults)
-        selected_tfs = st.multiselect("Timeframes", ['15m', '1h', '4h'], default=['15m', '1h', '4h'])
-        show_up = st.checkbox("Show UP Signals", value=True)
-        show_down = st.checkbox("Show DOWN Signals", value=True)
+        found.sort(key=lambda x: x['prio']) # Scalps First
 
-    if st.button("🔍 START SCAN", type="primary", use_container_width=True):
-        results = []
-        prog = st.progress(0)
-        
-        for i, pair in enumerate(selected_pairs):
-            for tf in selected_tfs:
-                df = fetch_ohlcv(exchange, pair, tf)
-                if df is not None:
-                    df = calculate_indicators(df)
-                    results.extend(detect_signals(df, pair, tf))
-            prog.progress((i + 1) / len(selected_pairs))
-            time.sleep(0.3) # Respect Gate.io rate limits
-
-        if not results:
-            st.info("No signals found in this batch.")
-        else:
-            for sig in results:
-                # Filtering logic
-                if sig['dir'] == 'UP' and not show_up: continue
-                if sig['dir'] == 'DOWN' and not show_down: continue
-                
-                # Mobile-friendly signal card
-                with st.container():
-                    c1, c2 = st.columns([3, 2])
-                    color_class = "up-signal" if sig['dir'] == 'UP' else "down-signal"
-                    
-                    c1.markdown(f"**{sig['symbol']}** ({sig['tf']})")
-                    c1.markdown(f"<span class='{color_class}'>{sig['type']}</span>", unsafe_allow_html=True)
-                    
-                    # Deep link to Gate.io Trade Page
-                    trade_url = f"https://www.gate.io/trade/{sig['symbol'].replace('/', '_')}"
-                    c2.link_button("🚀 Trade", trade_url, use_container_width=True)
-                    st.markdown("---")
+        for s in found:
+            c1, c2 = st.columns([3, 1])
+            cls = "up" if s['dir'] == "UP" else ("down" if s['dir'] == "DOWN" else "")
+            c1.markdown(f"<div class='signal-card'><b>{s['symbol']} ({s['tf']})</b><br><span class='{cls}'>{s['type']}</span> @ {s['price']}</div>", unsafe_allow_html=True)
+            url = f"https://www.gate.io/trade/{s['symbol'].replace('/', '_')}"
+            c2.link_button("Trade", url)
 
 if __name__ == "__main__":
     main()
